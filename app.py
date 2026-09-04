@@ -237,6 +237,8 @@ def init_db():
                 meeting_method TEXT,
                 purpose TEXT,
                 follow_up TEXT,
+                source_external_id TEXT,
+                source_synced_at TEXT,
                 FOREIGN KEY(folder_id) REFERENCES folders(id) ON DELETE SET NULL
             )
             """,
@@ -307,6 +309,9 @@ def init_db():
             "ALTER TABLE meetings ADD COLUMN IF NOT EXISTS meeting_method TEXT",
             "ALTER TABLE meetings ADD COLUMN IF NOT EXISTS purpose TEXT",
             "ALTER TABLE meetings ADD COLUMN IF NOT EXISTS follow_up TEXT",
+            "ALTER TABLE meetings ADD COLUMN IF NOT EXISTS source_external_id TEXT",
+            "ALTER TABLE meetings ADD COLUMN IF NOT EXISTS source_synced_at TEXT",
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_meetings_source_external_id ON meetings(source, source_external_id) WHERE source_external_id IS NOT NULL",
             "ALTER TABLE drafts ADD COLUMN IF NOT EXISTS location TEXT",
             "ALTER TABLE drafts ADD COLUMN IF NOT EXISTS meeting_method TEXT",
             "ALTER TABLE drafts ADD COLUMN IF NOT EXISTS participants TEXT",
@@ -371,6 +376,8 @@ def init_db():
                 meeting_method TEXT,
                 purpose TEXT,
                 follow_up TEXT,
+                source_external_id TEXT,
+                source_synced_at TEXT,
                 FOREIGN KEY(folder_id) REFERENCES folders(id) ON DELETE SET NULL
             );
 
@@ -446,6 +453,14 @@ def init_db():
             conn.execute("ALTER TABLE meetings ADD COLUMN purpose TEXT")
         if "follow_up" not in columns:
             conn.execute("ALTER TABLE meetings ADD COLUMN follow_up TEXT")
+        if "source_external_id" not in columns:
+            conn.execute("ALTER TABLE meetings ADD COLUMN source_external_id TEXT")
+        if "source_synced_at" not in columns:
+            conn.execute("ALTER TABLE meetings ADD COLUMN source_synced_at TEXT")
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_meetings_source_external_id "
+            "ON meetings(source, source_external_id) WHERE source_external_id IS NOT NULL"
+        )
 
         draft_columns = {r[1] for r in conn.execute("PRAGMA table_info(drafts)").fetchall()}
         if "location" not in draft_columns:
@@ -599,6 +614,16 @@ class MeetingUpdate(BaseModel):
     purpose: Optional[str] = None
     follow_up: Optional[str] = None
     follow_up_items: Optional[list[FollowUpItemIn]] = None
+
+
+class PlaudWebhookIn(BaseModel):
+    # Zapier maps the PLAUD trigger fields into these stable API keys.
+    title: Optional[str] = None
+    transcript: Optional[str] = None
+    summary: Optional[str] = None
+    create_time: Optional[str] = None
+    external_id: Optional[str] = None
+    recording_id: Optional[str] = None
 
 
 class ShareIn(BaseModel):
@@ -1090,6 +1115,7 @@ def health():
         "ok": True,
         "auth_configured": user_count > 0,
         "translation_configured": bool(OPENAI_API_KEY),
+        "plaud_webhook_configured": bool(WEBHOOK_SECRET and WEBHOOK_SECRET != "change-me"),
         "translation_model": OPENAI_TRANSLATION_MODEL,
         "cookie_secure": COOKIE_SECURE,
         "cookie_samesite": COOKIE_SAMESITE,
@@ -1263,12 +1289,149 @@ def database_diagnostics(admin=Depends(require_admin)):
         conn.close()
 
 
+def _plaud_source_external_id(payload: PlaudWebhookIn) -> str:
+    explicit_id = (payload.external_id or payload.recording_id or "").strip()
+    if explicit_id:
+        return "id:" + explicit_id
+
+    create_time = (payload.create_time or "").strip()
+    if not create_time:
+        raise HTTPException(
+            status_code=400,
+            detail="PLAUD create_time or an explicit external_id/recording_id is required for duplicate protection.",
+        )
+
+    title = (payload.title or "").strip()
+    material = f"plaud-zapier|{create_time}|{title}".encode("utf-8")
+    return "fallback:" + hashlib.sha256(material).hexdigest()
+
+
+def _plaud_webhook_secret_ok(received: Optional[str]) -> bool:
+    if not WEBHOOK_SECRET or WEBHOOK_SECRET == "change-me":
+        return False
+    return hmac.compare_digest(received or "", WEBHOOK_SECRET)
+
+
 @app.post("/api/plaud/webhook")
-def plaud_webhook(payload: MeetingIn, x_webhook_secret: Optional[str] = Header(default=None)):
-    if WEBHOOK_SECRET != "change-me" and x_webhook_secret != WEBHOOK_SECRET:
+def plaud_webhook(payload: PlaudWebhookIn, x_webhook_secret: Optional[str] = Header(default=None)):
+    # This endpoint is intentionally disabled until a real secret is configured in Render.
+    if not WEBHOOK_SECRET or WEBHOOK_SECRET == "change-me":
+        raise HTTPException(status_code=503, detail="PLAUD webhook is not configured")
+    if not _plaud_webhook_secret_ok(x_webhook_secret):
         raise HTTPException(status_code=401, detail="Invalid webhook secret")
-    payload.source = "plaud-zapier"
-    return create_meeting(payload)
+
+    transcript = (payload.transcript or "").strip()
+    summary = (payload.summary or "").strip()
+    if not transcript and not summary:
+        raise HTTPException(status_code=400, detail="PLAUD transcript or summary is required")
+
+    title = (payload.title or "").strip() or "PLAUD 회의"
+    recorded_at = (payload.create_time or "").strip() or None
+    source = "plaud-zapier"
+    source_external_id = _plaud_source_external_id(payload)
+    now = now_iso()
+
+    conn = db()
+    try:
+        existing = conn.execute(
+            """
+            SELECT id, title, transcript, summary, recorded_at, source,
+                   created_at, updated_at, source_synced_at
+            FROM meetings
+            WHERE source=? AND source_external_id=?
+            """,
+            (source, source_external_id),
+        ).fetchone()
+
+        if existing:
+            # An automatic refresh is safe only while the meeting has not been manually edited.
+            source_synced_at = existing["source_synced_at"]
+            automatically_owned = bool(source_synced_at and existing["updated_at"] == source_synced_at)
+
+            if automatically_owned:
+                conn.execute(
+                    """
+                    UPDATE meetings
+                    SET title=?, recorded_at=?, transcript=?, summary=?,
+                        updated_at=?, source_synced_at=?
+                    WHERE id=?
+                    """,
+                    (title, recorded_at, transcript, summary or None, now, now, existing["id"]),
+                )
+                conn.commit()
+                return {
+                    "ok": True,
+                    "status": "updated",
+                    "meeting_id": existing["id"],
+                    "source_external_id": source_external_id,
+                    "duplicate": True,
+                    "manual_edits_preserved": False,
+                }
+
+            return {
+                "ok": True,
+                "status": "duplicate_preserved",
+                "meeting_id": existing["id"],
+                "source_external_id": source_external_id,
+                "duplicate": True,
+                "manual_edits_preserved": True,
+            }
+
+        cur = conn.execute(
+            """
+            INSERT INTO meetings(
+                title, recorded_at, transcript, summary, participants,
+                source, created_at, updated_at, folder_id, author,
+                location, meeting_method, purpose, follow_up,
+                source_external_id, source_synced_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                title, recorded_at, transcript, summary or None, None,
+                source, now, now, None, None,
+                None, None, None, None,
+                source_external_id, now,
+            ),
+        )
+        meeting_id = cur.lastrowid
+        conn.commit()
+        return {
+            "ok": True,
+            "status": "created",
+            "meeting_id": meeting_id,
+            "source_external_id": source_external_id,
+            "duplicate": False,
+            "storage_backend": "postgresql" if USE_POSTGRES else "sqlite_ephemeral",
+        }
+    except DB_INTEGRITY_ERRORS:
+        # A simultaneous retry can race the unique index. Treat the winner as the canonical import.
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        existing = conn.execute(
+            "SELECT id FROM meetings WHERE source=? AND source_external_id=?",
+            (source, source_external_id),
+        ).fetchone()
+        if existing:
+            return {
+                "ok": True,
+                "status": "duplicate_race_preserved",
+                "meeting_id": existing["id"],
+                "source_external_id": source_external_id,
+                "duplicate": True,
+                "manual_edits_preserved": True,
+            }
+        raise
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        conn.close()
 
 
 @app.get("/api/drafts/current")
